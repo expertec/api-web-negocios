@@ -14,15 +14,33 @@ app.use(cors());
 app.use(express.json());
 
 // Inicializar Firebase Admin
-// En Render, configurar variable de entorno FIREBASE_CONFIG con el JSON de credenciales
-const serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG || '{}');
+// Soporta tanto archivo secreto en Render como variable de entorno
+let serviceAccount;
 
-if (Object.keys(serviceAccount).length > 0) {
+try {
+  // Opción 1: Intentar leer archivo secreto de Render
+  const fs = require('fs');
+  const secretPath = '/etc/secrets/serviceAccountKey.json';
+  
+  if (fs.existsSync(secretPath)) {
+    console.log('✅ Usando archivo secreto de Render');
+    serviceAccount = require(secretPath);
+  } else if (process.env.FIREBASE_CONFIG) {
+    // Opción 2: Usar variable de entorno (fallback)
+    console.log('✅ Usando variable de entorno FIREBASE_CONFIG');
+    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
+  } else {
+    throw new Error('No se encontró configuración de Firebase');
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount)
   });
-} else {
-  console.log('⚠️  Firebase no configurado. Usar variable FIREBASE_CONFIG');
+  
+  console.log('🔥 Firebase inicializado correctamente');
+} catch (error) {
+  console.error('❌ Error inicializando Firebase:', error.message);
+  console.log('⚠️  La API funcionará con funcionalidad limitada');
 }
 
 const db = admin.firestore();
