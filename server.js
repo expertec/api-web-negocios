@@ -163,8 +163,36 @@ app.get('/api/super-admin/negocios', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { user, pin } = req.body;
+    const { user, pin, negocioID } = req.body;
 
+    // Si se proporciona negocioID, validar que el usuario pertenezca a ese negocio
+    if (negocioID) {
+      const negocioDoc = await db.collection('negocios').doc(negocioID).get();
+      
+      if (!negocioDoc.exists) {
+        return res.status(404).json({ error: 'Negocio no encontrado' });
+      }
+
+      const negocio = negocioDoc.data();
+
+      // Validar que el usuario y PIN coincidan con este negocio específico
+      if (negocio.user !== user || negocio.pin !== pin) {
+        return res.status(401).json({ error: 'Credenciales inválidas para este negocio' });
+      }
+
+      if (!negocio.activo) {
+        return res.status(403).json({ error: 'Negocio inactivo' });
+      }
+
+      return res.json({
+        success: true,
+        negocioID: negocio.negocioID,
+        nombreNegocio: negocio.nombreNegocio,
+        briefCompletado: negocio.briefCompletado
+      });
+    }
+
+    // Si no se proporciona negocioID, buscar en todos (para Brief)
     const snapshot = await db.collection('negocios')
       .where('user', '==', user)
       .where('pin', '==', pin)
