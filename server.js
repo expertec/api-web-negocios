@@ -116,6 +116,104 @@ app.delete('/api/:negocioID/delete-imagen', async (req, res) => {
 });
 
 // ============================================
+// SUPER ADMIN - GESTIÓN DE NEGOCIOS
+// ============================================
+app.get('/api/super-admin/negocios', async (req, res) => {
+  try {
+    const negociosRef = db.collection('negocios');
+    const snapshot = await negociosRef.get();
+
+    const negocios = [];
+    snapshot.forEach(doc => {
+      const data = doc.data();
+      negocios.push({
+        id: doc.id,
+        nombre: data.nombre,
+        admin: data.admin,
+        colores: data.colores,
+        createdAt: data.createdAt,
+        updatedAt: data.updatedAt
+      });
+    });
+
+    res.json({ negocios });
+  } catch (error) {
+    console.error('Error obteniendo negocios:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/super-admin/negocios', async (req, res) => {
+  try {
+    const negocio = req.body;
+
+    // Generar ID único
+    const negocioID = 'neg_' + Math.random().toString(36).substring(2, 15);
+
+    // Crear documento del negocio con estructura completa
+    await db.collection('negocios').doc(negocioID).set({
+      ...negocio,
+      seccionesActivas: {
+        hero: true,
+        servicios: true,
+        nosotros: true,
+        casosExito: true,
+        testimonios: true,
+        galeria: true,
+        contacto: true
+      },
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, negocioID });
+  } catch (error) {
+    console.error('Error creando negocio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/super-admin/negocios/:negocioID', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const datos = req.body;
+
+    await db.collection('negocios').doc(negocioID).update({
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error actualizando negocio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/super-admin/negocios/:negocioID', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    
+    // Eliminar todas las subcolecciones
+    const collections = ['productos', 'servicios', 'testimonios', 'casosExito', 'galeria', 'pedidos'];
+    
+    for (const collectionName of collections) {
+      const snapshot = await db.collection('negocios').doc(negocioID).collection(collectionName).get();
+      const batch = db.batch();
+      snapshot.docs.forEach(doc => batch.delete(doc.ref));
+      await batch.commit();
+    }
+
+    // Eliminar documento principal
+    await db.collection('negocios').doc(negocioID).delete();
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error eliminando negocio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // AUTENTICACIÓN
 // ============================================
 app.post('/api/auth/login', async (req, res) => {
@@ -614,11 +712,14 @@ app.get('/', (req, res) => {
     message: 'API Multi-tenant con sistema modular',
     version: '2.0.0',
     endpoints: [
+      'CRUD /api/super-admin/negocios - Gestión de negocios',
       'POST /api/auth/login',
       'GET /api/:negocioID/config',
       'PUT /api/:negocioID/config',
       'GET /api/:negocioID/secciones',
       'PUT /api/:negocioID/secciones',
+      'POST /api/:negocioID/upload-imagen',
+      'DELETE /api/:negocioID/delete-imagen',
       'CRUD /api/:negocioID/productos',
       'CRUD /api/:negocioID/servicios',
       'CRUD /api/:negocioID/testimonios',
