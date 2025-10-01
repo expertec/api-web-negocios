@@ -1,158 +1,86 @@
-// API Node.js para Sistema Multi-tenant
-// Deploy en Render.com
-
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const crypto = require('crypto');
+const multer = require('multer');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware - CORS configurado correctamente
-app.use(cors({
-  origin: '*', // Permite todas las origenes
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
-}));
-app.use(express.json());
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Inicializar Firebase Admin
-// Soporta tanto archivo secreto en Render como variable de entorno
-let serviceAccount;
-
-try {
-  // Opción 1: Intentar leer archivo secreto de Render
-  const fs = require('fs');
-  const secretPath = '/etc/secrets/serviceAccountKey.json';
-  
-  if (fs.existsSync(secretPath)) {
-    console.log('✅ Usando archivo secreto de Render');
-    serviceAccount = require(secretPath);
-  } else if (process.env.FIREBASE_CONFIG) {
-    // Opción 2: Usar variable de entorno (fallback)
-    console.log('✅ Usando variable de entorno FIREBASE_CONFIG');
-    serviceAccount = JSON.parse(process.env.FIREBASE_CONFIG);
-  } else {
-    throw new Error('No se encontró configuración de Firebase');
-  }
-
-  admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-  });
-  
-  console.log('🔥 Firebase inicializado correctamente');
-} catch (error) {
-  console.error('❌ Error inicializando Firebase:', error.message);
-  console.log('⚠️  La API funcionará con funcionalidad limitada');
-}
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'tu-proyecto.appspot.com'
+});
 
 const db = admin.firestore();
+const bucket = admin.storage().bucket();
 
 // ============================================
-// UTILIDADES
+// UPLOAD DE IMÁGENES
 // ============================================
-
-function generarUser(nombreNegocio) {
-  const base = nombreNegocio
-    .toLowerCase()
-    .normalize("NFD").replace(/[\u0300-\u036f]/g, "") // quitar acentos
-    .replace(/[^a-z0-9]/g, '-')
-    .replace(/-+/g, '-')
-    .substring(0, 20);
-  const year = new Date().getFullYear();
-  return `${base}-${year}`;
-}
-
-function generarPIN() {
-  return Math.floor(1000 + Math.random() * 9000).toString();
-}
-
-function generarNegocioID() {
-  return 'neg_' + crypto.randomBytes(8).toString('hex');
-}
-
-// ============================================
-// SUPER ADMIN - Gestión de Negocios
-// ============================================
-
-// Crear nuevo negocio
-app.post('/api/super-admin/negocios', async (req, res) => {
+app.post('/api/:negocioID/upload-imagen', async (req, res) => {
   try {
-    const { nombreNegocio, email, superAdminKey } = req.body;
+    const { negocioID } = req.params;
+    const { imagen, nombre } = req.body; // imagen en base64
 
-    // Validar super admin key
-    if (superAdminKey !== process.env.SUPER_ADMIN_KEY) {
-      return res.status(403).json({ error: 'No autorizado' });
+    if (!imagen) {
+      return res.status(400).json({ error: 'No se proporcionó imagen' });
     }
 
-    const negocioID = generarNegocioID();
-    const user = generarUser(nombreNegocio);
-    const pin = generarPIN();
+    // Convertir base64 a buffer
+    const base64Data = imagen.replace(/^data:image\/\w+;base64,/, '');
+    const buffer = Buffer.from(base64Data, 'base64');
 
-    const negocioData = {
-      negocioID,
-      user,
-      pin,
-      nombreNegocio,
-      email,
-      activo: true,
-      briefCompletado: false,
-      fechaCreacion: admin.firestore.FieldValue.serverTimestamp(),
-      config: {
-        nombre: nombreNegocio,
-        colores: {
-          primario: '#3B82F6',
-          secundario: '#10B981'
-        },
-        contacto: {
-          email,
-          telefono: '',
-          whatsapp: '',
-          direccion: '',
-          redesSociales: {}
+    // Generar nombre único
+    const timestamp = Date.now();
+    const fileName = `${negocioID}/${timestamp}-${nombre || 'imagen'}.jpg`;
+
+    // Subir a Firebase Storage
+    const file = bucket.file(fileName);
+    await file.save(buffer, {
+      metadata: {
+        contentType: 'image/jpeg',
+        metadata: {
+          negocioID: negocioID
         }
-      }
-    };
+      },
+      public: true
+    });
 
-    await db.collection('negocios').doc(negocioID).set(negocioData);
+    // Obtener URL pública
+    const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
 
-    res.json({
-      success: true,
-      negocio: {
-        negocioID,
-        user,
-        pin,
-        nombreNegocio,
-        email
-      }
+    res.json({ 
+      success: true, 
+      url: publicUrl,
+      fileName: fileName 
     });
   } catch (error) {
-    console.error('Error creando negocio:', error);
+    console.error('Error subiendo imagen:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Listar todos los negocios
-app.get('/api/super-admin/negocios', async (req, res) => {
+// Eliminar imagen
+app.delete('/api/:negocioID/delete-imagen', async (req, res) => {
   try {
-    const { superAdminKey } = req.query;
+    const { fileName } = req.body;
 
-    if (superAdminKey !== process.env.SUPER_ADMIN_KEY) {
-      return res.status(403).json({ error: 'No autorizado' });
+    if (!fileName) {
+      return res.status(400).json({ error: 'No se proporcionó nombre de archivo' });
     }
 
-    const snapshot = await db.collection('negocios').get();
-    const negocios = [];
+    await bucket.file(fileName).delete();
 
-    snapshot.forEach(doc => {
-      negocios.push({ id: doc.id, ...doc.data() });
-    });
-
-    res.json({ negocios });
+    res.json({ success: true, message: 'Imagen eliminada' });
   } catch (error) {
-    console.error('Error listando negocios:', error);
+    console.error('Error eliminando imagen:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -160,61 +88,32 @@ app.get('/api/super-admin/negocios', async (req, res) => {
 // ============================================
 // AUTENTICACIÓN
 // ============================================
-
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { user, pin, negocioID } = req.body;
 
-    // Si se proporciona negocioID, validar que el usuario pertenezca a ese negocio
-    if (negocioID) {
-      const negocioDoc = await db.collection('negocios').doc(negocioID).get();
-      
-      if (!negocioDoc.exists) {
-        return res.status(404).json({ error: 'Negocio no encontrado' });
-      }
+    if (!user || !pin || !negocioID) {
+      return res.status(400).json({ error: 'Faltan datos' });
+    }
 
-      const negocio = negocioDoc.data();
+    const negocioRef = db.collection('negocios').doc(negocioID);
+    const negocioDoc = await negocioRef.get();
 
-      // Validar que el usuario y PIN coincidan con este negocio específico
-      if (negocio.user !== user || negocio.pin !== pin) {
-        return res.status(401).json({ error: 'Credenciales inválidas para este negocio' });
-      }
+    if (!negocioDoc.exists) {
+      return res.status(404).json({ error: 'Negocio no encontrado' });
+    }
 
-      if (!negocio.activo) {
-        return res.status(403).json({ error: 'Negocio inactivo' });
-      }
+    const negocioData = negocioDoc.data();
 
+    if (negocioData.admin?.user === user && negocioData.admin?.pin === pin) {
       return res.json({
         success: true,
-        negocioID: negocio.negocioID,
-        nombreNegocio: negocio.nombreNegocio,
-        briefCompletado: negocio.briefCompletado
+        negocioID: negocioID,
+        nombre: negocioData.nombre
       });
     }
 
-    // Si no se proporciona negocioID, buscar en todos (para Brief)
-    const snapshot = await db.collection('negocios')
-      .where('user', '==', user)
-      .where('pin', '==', pin)
-      .limit(1)
-      .get();
-
-    if (snapshot.empty) {
-      return res.status(401).json({ error: 'Credenciales inválidas' });
-    }
-
-    const negocio = snapshot.docs[0].data();
-
-    if (!negocio.activo) {
-      return res.status(403).json({ error: 'Negocio inactivo' });
-    }
-
-    res.json({
-      success: true,
-      negocioID: negocio.negocioID,
-      nombreNegocio: negocio.nombreNegocio,
-      briefCompletado: negocio.briefCompletado
-    });
+    res.status(401).json({ error: 'Credenciales inválidas para este negocio' });
   } catch (error) {
     console.error('Error en login:', error);
     res.status(500).json({ error: error.message });
@@ -222,83 +121,35 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ============================================
-// BRIEF - Formulario inicial
+// CONFIGURACIÓN
 // ============================================
-
-app.post('/api/:negocioID/brief', async (req, res) => {
-  try {
-    const { negocioID } = req.params;
-    const briefData = req.body;
-
-    const negocioRef = db.collection('negocios').doc(negocioID);
-    const negocio = await negocioRef.get();
-
-    if (!negocio.exists) {
-      return res.status(404).json({ error: 'Negocio no encontrado' });
-    }
-
-    await negocioRef.update({
-      briefCompletado: true,
-      config: {
-        ...negocio.data().config,
-        ...briefData.config
-      }
-    });
-
-    // Guardar productos iniciales
-    if (briefData.productosIniciales && briefData.productosIniciales.length > 0) {
-      const batch = db.batch();
-      briefData.productosIniciales.forEach(producto => {
-        const productoRef = db.collection('negocios').doc(negocioID)
-          .collection('productos').doc();
-        batch.set(productoRef, {
-          ...producto,
-          activo: true,
-          fechaCreacion: admin.firestore.FieldValue.serverTimestamp()
-        });
-      });
-      await batch.commit();
-    }
-
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Error guardando brief:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============================================
-// CONFIG - Obtener configuración del negocio
-// ============================================
-
 app.get('/api/:negocioID/config', async (req, res) => {
   try {
     const { negocioID } = req.params;
+    const negocioDoc = await db.collection('negocios').doc(negocioID).get();
 
-    const negocio = await db.collection('negocios').doc(negocioID).get();
-
-    if (!negocio.exists) {
+    if (!negocioDoc.exists) {
       return res.status(404).json({ error: 'Negocio no encontrado' });
     }
 
-    res.json(negocio.data().config);
+    res.json(negocioDoc.data());
   } catch (error) {
     console.error('Error obteniendo config:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Actualizar configuración
 app.put('/api/:negocioID/config', async (req, res) => {
   try {
     const { negocioID } = req.params;
-    const updates = req.body;
+    const datos = req.body;
 
     await db.collection('negocios').doc(negocioID).update({
-      'config': updates
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ success: true });
+    res.json({ success: true, message: 'Configuración actualizada' });
   } catch (error) {
     console.error('Error actualizando config:', error);
     res.status(500).json({ error: error.message });
@@ -306,63 +157,99 @@ app.put('/api/:negocioID/config', async (req, res) => {
 });
 
 // ============================================
+// SECCIONES ACTIVAS
+// ============================================
+app.get('/api/:negocioID/secciones', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const negocioDoc = await db.collection('negocios').doc(negocioID).get();
+
+    if (!negocioDoc.exists) {
+      return res.status(404).json({ error: 'Negocio no encontrado' });
+    }
+
+    const data = negocioDoc.data();
+    res.json({
+      secciones: data.seccionesActivas || {
+        hero: true,
+        servicios: true,
+        nosotros: true,
+        casosExito: true,
+        testimonios: true,
+        galeria: true,
+        contacto: true
+      }
+    });
+  } catch (error) {
+    console.error('Error obteniendo secciones:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/:negocioID/secciones', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const { secciones } = req.body;
+
+    await db.collection('negocios').doc(negocioID).update({
+      seccionesActivas: secciones,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, message: 'Secciones actualizadas' });
+  } catch (error) {
+    console.error('Error actualizando secciones:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // PRODUCTOS
 // ============================================
-
-// Listar productos
 app.get('/api/:negocioID/productos', async (req, res) => {
   try {
     const { negocioID } = req.params;
-    const { soloActivos } = req.query;
+    const productosRef = db.collection('negocios').doc(negocioID).collection('productos');
+    const snapshot = await productosRef.where('activo', '==', true).get();
 
-    let query = db.collection('negocios').doc(negocioID).collection('productos');
-
-    if (soloActivos === 'true') {
-      query = query.where('activo', '==', true);
-    }
-
-    const snapshot = await query.get();
     const productos = [];
-
     snapshot.forEach(doc => {
       productos.push({ id: doc.id, ...doc.data() });
     });
 
     res.json({ productos });
   } catch (error) {
-    console.error('Error listando productos:', error);
+    console.error('Error obteniendo productos:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Crear producto
 app.post('/api/:negocioID/productos', async (req, res) => {
   try {
     const { negocioID } = req.params;
     const producto = req.body;
 
-    const docRef = await db.collection('negocios').doc(negocioID)
-      .collection('productos').add({
-        ...producto,
-        activo: true,
-        fechaCreacion: admin.firestore.FieldValue.serverTimestamp()
-      });
+    const docRef = await db.collection('negocios').doc(negocioID).collection('productos').add({
+      ...producto,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-    res.json({ success: true, productoID: docRef.id });
+    res.json({ success: true, id: docRef.id });
   } catch (error) {
     console.error('Error creando producto:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Actualizar producto
 app.put('/api/:negocioID/productos/:productoID', async (req, res) => {
   try {
     const { negocioID, productoID } = req.params;
-    const updates = req.body;
+    const datos = req.body;
 
-    await db.collection('negocios').doc(negocioID)
-      .collection('productos').doc(productoID).update(updates);
+    await db.collection('negocios').doc(negocioID).collection('productos').doc(productoID).update({
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     res.json({ success: true });
   } catch (error) {
@@ -371,14 +258,10 @@ app.put('/api/:negocioID/productos/:productoID', async (req, res) => {
   }
 });
 
-// Eliminar producto
 app.delete('/api/:negocioID/productos/:productoID', async (req, res) => {
   try {
     const { negocioID, productoID } = req.params;
-
-    await db.collection('negocios').doc(negocioID)
-      .collection('productos').doc(productoID).delete();
-
+    await db.collection('negocios').doc(negocioID).collection('productos').doc(productoID).delete();
     res.json({ success: true });
   } catch (error) {
     console.error('Error eliminando producto:', error);
@@ -387,65 +270,300 @@ app.delete('/api/:negocioID/productos/:productoID', async (req, res) => {
 });
 
 // ============================================
+// SERVICIOS
+// ============================================
+app.get('/api/:negocioID/servicios', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const serviciosRef = db.collection('negocios').doc(negocioID).collection('servicios');
+    const snapshot = await serviciosRef.orderBy('orden', 'asc').get();
+
+    const servicios = [];
+    snapshot.forEach(doc => {
+      servicios.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ servicios });
+  } catch (error) {
+    console.error('Error obteniendo servicios:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/:negocioID/servicios', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const servicio = req.body;
+
+    const docRef = await db.collection('negocios').doc(negocioID).collection('servicios').add({
+      ...servicio,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, id: docRef.id });
+  } catch (error) {
+    console.error('Error creando servicio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/:negocioID/servicios/:servicioID', async (req, res) => {
+  try {
+    const { negocioID, servicioID } = req.params;
+    const datos = req.body;
+
+    await db.collection('negocios').doc(negocioID).collection('servicios').doc(servicioID).update({
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error actualizando servicio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/:negocioID/servicios/:servicioID', async (req, res) => {
+  try {
+    const { negocioID, servicioID } = req.params;
+    await db.collection('negocios').doc(negocioID).collection('servicios').doc(servicioID).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error eliminando servicio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// TESTIMONIOS
+// ============================================
+app.get('/api/:negocioID/testimonios', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const testimoniosRef = db.collection('negocios').doc(negocioID).collection('testimonios');
+    const snapshot = await testimoniosRef.orderBy('orden', 'asc').get();
+
+    const testimonios = [];
+    snapshot.forEach(doc => {
+      testimonios.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ testimonios });
+  } catch (error) {
+    console.error('Error obteniendo testimonios:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/:negocioID/testimonios', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const testimonio = req.body;
+
+    const docRef = await db.collection('negocios').doc(negocioID).collection('testimonios').add({
+      ...testimonio,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, id: docRef.id });
+  } catch (error) {
+    console.error('Error creando testimonio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/:negocioID/testimonios/:testimonioID', async (req, res) => {
+  try {
+    const { negocioID, testimonioID } = req.params;
+    const datos = req.body;
+
+    await db.collection('negocios').doc(negocioID).collection('testimonios').doc(testimonioID).update({
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error actualizando testimonio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/:negocioID/testimonios/:testimonioID', async (req, res) => {
+  try {
+    const { negocioID, testimonioID } = req.params;
+    await db.collection('negocios').doc(negocioID).collection('testimonios').doc(testimonioID).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error eliminando testimonio:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// CASOS DE ÉXITO
+// ============================================
+app.get('/api/:negocioID/casos-exito', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const casosRef = db.collection('negocios').doc(negocioID).collection('casosExito');
+    const snapshot = await casosRef.orderBy('orden', 'asc').get();
+
+    const casos = [];
+    snapshot.forEach(doc => {
+      casos.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ casos });
+  } catch (error) {
+    console.error('Error obteniendo casos:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/:negocioID/casos-exito', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const caso = req.body;
+
+    const docRef = await db.collection('negocios').doc(negocioID).collection('casosExito').add({
+      ...caso,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, id: docRef.id });
+  } catch (error) {
+    console.error('Error creando caso:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.put('/api/:negocioID/casos-exito/:casoID', async (req, res) => {
+  try {
+    const { negocioID, casoID } = req.params;
+    const datos = req.body;
+
+    await db.collection('negocios').doc(negocioID).collection('casosExito').doc(casoID).update({
+      ...datos,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error actualizando caso:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/:negocioID/casos-exito/:casoID', async (req, res) => {
+  try {
+    const { negocioID, casoID } = req.params;
+    await db.collection('negocios').doc(negocioID).collection('casosExito').doc(casoID).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error eliminando caso:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
+// GALERÍA
+// ============================================
+app.get('/api/:negocioID/galeria', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const galeriaRef = db.collection('negocios').doc(negocioID).collection('galeria');
+    const snapshot = await galeriaRef.orderBy('orden', 'asc').get();
+
+    const imagenes = [];
+    snapshot.forEach(doc => {
+      imagenes.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ imagenes });
+  } catch (error) {
+    console.error('Error obteniendo galería:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/:negocioID/galeria', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const imagen = req.body;
+
+    const docRef = await db.collection('negocios').doc(negocioID).collection('galeria').add({
+      ...imagen,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    res.json({ success: true, id: docRef.id });
+  } catch (error) {
+    console.error('Error agregando imagen:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/:negocioID/galeria/:imagenID', async (req, res) => {
+  try {
+    const { negocioID, imagenID } = req.params;
+    await db.collection('negocios').doc(negocioID).collection('galeria').doc(imagenID).delete();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error eliminando imagen:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================
 // PEDIDOS
 // ============================================
+app.get('/api/:negocioID/pedidos', async (req, res) => {
+  try {
+    const { negocioID } = req.params;
+    const pedidosRef = db.collection('negocios').doc(negocioID).collection('pedidos');
+    const snapshot = await pedidosRef.orderBy('fechaCreacion', 'desc').get();
 
-// Crear pedido (desde sitio público)
+    const pedidos = [];
+    snapshot.forEach(doc => {
+      pedidos.push({ id: doc.id, ...doc.data() });
+    });
+
+    res.json({ pedidos });
+  } catch (error) {
+    console.error('Error obteniendo pedidos:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.post('/api/:negocioID/pedidos', async (req, res) => {
   try {
     const { negocioID } = req.params;
     const pedido = req.body;
 
-    const docRef = await db.collection('negocios').doc(negocioID)
-      .collection('pedidos').add({
-        ...pedido,
-        estado: 'pendiente',
-        fechaCreacion: admin.firestore.FieldValue.serverTimestamp()
-      });
+    const docRef = await db.collection('negocios').doc(negocioID).collection('pedidos').add({
+      ...pedido,
+      estado: 'pendiente',
+      fechaCreacion: admin.firestore.FieldValue.serverTimestamp()
+    });
 
-    res.json({ success: true, pedidoID: docRef.id });
+    res.json({ success: true, id: docRef.id });
   } catch (error) {
     console.error('Error creando pedido:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-// Listar pedidos
-app.get('/api/:negocioID/pedidos', async (req, res) => {
-  try {
-    const { negocioID } = req.params;
-
-    const snapshot = await db.collection('negocios').doc(negocioID)
-      .collection('pedidos')
-      .orderBy('fechaCreacion', 'desc')
-      .get();
-
-    const pedidos = [];
-
-    snapshot.forEach(doc => {
-      const data = doc.data();
-      pedidos.push({
-        id: doc.id,
-        ...data,
-        fechaCreacion: data.fechaCreacion?.toDate()
-      });
-    });
-
-    res.json({ pedidos });
-  } catch (error) {
-    console.error('Error listando pedidos:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Actualizar estado de pedido
 app.put('/api/:negocioID/pedidos/:pedidoID', async (req, res) => {
   try {
     const { negocioID, pedidoID } = req.params;
     const { estado } = req.body;
 
-    await db.collection('negocios').doc(negocioID)
-      .collection('pedidos').doc(pedidoID).update({ estado });
+    await db.collection('negocios').doc(negocioID).collection('pedidos').doc(pedidoID).update({
+      estado,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
 
     res.json({ success: true });
   } catch (error) {
@@ -455,65 +573,32 @@ app.put('/api/:negocioID/pedidos/:pedidoID', async (req, res) => {
 });
 
 // ============================================
-// IA - Generación de contenido
-// ============================================
-
-app.post('/api/ia/generar-texto', async (req, res) => {
-  try {
-    const { prompt, tipo } = req.body;
-
-    // Aquí integrarías OpenAI o Claude API
-    // Por ahora, respuesta mock
-    let textoGenerado = '';
-
-    switch(tipo) {
-      case 'sobre-nosotros':
-        textoGenerado = `Somos una empresa dedicada a brindar los mejores productos y servicios. Con años de experiencia en el mercado, nos caracterizamos por nuestra calidad y atención al cliente.`;
-        break;
-      case 'mision':
-        textoGenerado = `Nuestra misión es ofrecer productos de la más alta calidad, superando las expectativas de nuestros clientes y contribuyendo al desarrollo de nuestra comunidad.`;
-        break;
-      case 'vision':
-        textoGenerado = `Ser líderes en nuestro sector, reconocidos por nuestra innovación, compromiso y excelencia en el servicio.`;
-        break;
-      default:
-        textoGenerado = prompt;
-    }
-
-    res.json({ texto: textoGenerado });
-  } catch (error) {
-    console.error('Error generando texto:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ============================================
 // HEALTH CHECK
 // ============================================
-
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
 app.get('/', (req, res) => {
-  res.json({ 
-    message: 'API Multi-tenant funcionando',
-    version: '1.0.0',
+  res.json({
+    message: 'API Multi-tenant con sistema modular',
+    version: '2.0.0',
     endpoints: [
-      'POST /api/super-admin/negocios',
-      'GET /api/super-admin/negocios',
       'POST /api/auth/login',
-      'POST /api/:negocioID/brief',
       'GET /api/:negocioID/config',
-      'GET /api/:negocioID/productos',
-      'POST /api/:negocioID/productos',
-      'GET /api/:negocioID/pedidos',
-      'POST /api/:negocioID/pedidos'
+      'PUT /api/:negocioID/config',
+      'GET /api/:negocioID/secciones',
+      'PUT /api/:negocioID/secciones',
+      'CRUD /api/:negocioID/productos',
+      'CRUD /api/:negocioID/servicios',
+      'CRUD /api/:negocioID/testimonios',
+      'CRUD /api/:negocioID/casos-exito',
+      'CRUD /api/:negocioID/galeria',
+      'CRUD /api/:negocioID/pedidos'
     ]
   });
 });
 
-// Iniciar servidor
 app.listen(PORT, () => {
-  console.log(`🚀 API corriendo en puerto ${PORT}`);
+  console.log(`🚀 API modular corriendo en puerto ${PORT}`);
 });
