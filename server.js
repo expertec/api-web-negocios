@@ -1,7 +1,8 @@
 const express = require('express');
 const cors = require('cors');
 const admin = require('firebase-admin');
-const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -11,11 +12,39 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Inicializar Firebase Admin
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+// Leer credenciales de Firebase desde archivo secreto o variable de entorno
+let serviceAccount;
+const secretPath = '/etc/secrets/serviceAccountKey.json';
+
+try {
+  if (fs.existsSync(secretPath)) {
+    // Leer desde archivo secreto de Render
+    console.log('Leyendo credenciales desde archivo secreto...');
+    const fileContent = fs.readFileSync(secretPath, 'utf8');
+    serviceAccount = JSON.parse(fileContent);
+  } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // Fallback a variable de entorno
+    console.log('Leyendo credenciales desde variable de entorno...');
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+  } else {
+    throw new Error('No se encontraron credenciales de Firebase');
+  }
+} catch (error) {
+  console.error('ERROR cargando credenciales de Firebase:', error.message);
+  process.exit(1);
+}
+
+// Extraer storageBucket del serviceAccount
+const storageBucket = process.env.FIREBASE_STORAGE_BUCKET || 
+                      serviceAccount.project_id + '.appspot.com';
+
+console.log('Inicializando Firebase...');
+console.log('Project ID:', serviceAccount.project_id);
+console.log('Storage bucket:', storageBucket);
+
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  storageBucket: process.env.FIREBASE_STORAGE_BUCKET || 'tu-proyecto.appspot.com'
+  storageBucket: storageBucket
 });
 
 const db = admin.firestore();
@@ -39,13 +68,14 @@ app.post('/api/:negocioID/upload-imagen', async (req, res) => {
 
     // Generar nombre único
     const timestamp = Date.now();
-    const fileName = `${negocioID}/${timestamp}-${nombre || 'imagen'}.jpg`;
+    const extension = imagen.match(/^data:image\/(\w+);base64,/)?.[1] || 'jpg';
+    const fileName = `${negocioID}/${timestamp}-${nombre || 'imagen'}.${extension}`;
 
     // Subir a Firebase Storage
     const file = bucket.file(fileName);
     await file.save(buffer, {
       metadata: {
-        contentType: 'image/jpeg',
+        contentType: `image/${extension}`,
         metadata: {
           negocioID: negocioID
         }
