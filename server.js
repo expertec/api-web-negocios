@@ -18,12 +18,10 @@ const secretPath = '/etc/secrets/serviceAccountKey.json';
 
 try {
   if (fs.existsSync(secretPath)) {
-    // Leer desde archivo secreto de Render
     console.log('Leyendo credenciales desde archivo secreto...');
     const fileContent = fs.readFileSync(secretPath, 'utf8');
     serviceAccount = JSON.parse(fileContent);
   } else if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-    // Fallback a variable de entorno
     console.log('Leyendo credenciales desde variable de entorno...');
     serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
   } else {
@@ -51,27 +49,41 @@ const db = admin.firestore();
 const bucket = admin.storage().bucket();
 
 // ============================================
+// SUPER ADMIN KEY Y MIDDLEWARE
+// ============================================
+const SUPER_ADMIN_KEY = process.env.SUPER_ADMIN_KEY || 'Thulu@1971';
+console.log('Super Admin configurado');
+
+// Middleware para validar Super Admin
+function validarSuperAdmin(req, res, next) {
+  const key = req.query.superAdminKey || req.body.superAdminKey || req.headers['x-super-admin-key'];
+  
+  if (!key || key !== SUPER_ADMIN_KEY) {
+    return res.status(401).json({ error: 'No autorizado - Clave de Super Admin inválida' });
+  }
+  
+  next();
+}
+
+// ============================================
 // UPLOAD DE IMÁGENES
 // ============================================
 app.post('/api/:negocioID/upload-imagen', async (req, res) => {
   try {
     const { negocioID } = req.params;
-    const { imagen, nombre } = req.body; // imagen en base64
+    const { imagen, nombre } = req.body;
 
     if (!imagen) {
       return res.status(400).json({ error: 'No se proporcionó imagen' });
     }
 
-    // Convertir base64 a buffer
     const base64Data = imagen.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(base64Data, 'base64');
 
-    // Generar nombre único
     const timestamp = Date.now();
     const extension = imagen.match(/^data:image\/(\w+);base64,/)?.[1] || 'jpg';
     const fileName = `${negocioID}/${timestamp}-${nombre || 'imagen'}.${extension}`;
 
-    // Subir a Firebase Storage
     const file = bucket.file(fileName);
     await file.save(buffer, {
       metadata: {
@@ -83,7 +95,6 @@ app.post('/api/:negocioID/upload-imagen', async (req, res) => {
       public: true
     });
 
-    // Obtener URL pública
     const publicUrl = `https://storage.googleapis.com/${bucket.name}/${fileName}`;
 
     res.json({ 
@@ -97,7 +108,6 @@ app.post('/api/:negocioID/upload-imagen', async (req, res) => {
   }
 });
 
-// Eliminar imagen
 app.delete('/api/:negocioID/delete-imagen', async (req, res) => {
   try {
     const { fileName } = req.body;
@@ -116,9 +126,9 @@ app.delete('/api/:negocioID/delete-imagen', async (req, res) => {
 });
 
 // ============================================
-// SUPER ADMIN - GESTIÓN DE NEGOCIOS
+// SUPER ADMIN - GESTIÓN DE NEGOCIOS (PROTEGIDO)
 // ============================================
-app.get('/api/super-admin/negocios', async (req, res) => {
+app.get('/api/super-admin/negocios', validarSuperAdmin, async (req, res) => {
   try {
     const negociosRef = db.collection('negocios');
     const snapshot = await negociosRef.get();
@@ -128,10 +138,15 @@ app.get('/api/super-admin/negocios', async (req, res) => {
       const data = doc.data();
       negocios.push({
         id: doc.id,
-        nombre: data.nombre,
-        admin: data.admin,
+        negocioID: doc.id,
+        nombreNegocio: data.nombre || 'Sin nombre',
+        email: data.admin?.email || 'N/A',
+        user: data.admin?.user || 'N/A',
+        pin: data.admin?.pin || 'N/A',
+        activo: data.activo !== false,
+        briefCompletado: data.briefCompletado || false,
+        fechaCreacion: data.createdAt,
         colores: data.colores,
-        createdAt: data.createdAt,
         updatedAt: data.updatedAt
       });
     });
@@ -143,16 +158,47 @@ app.get('/api/super-admin/negocios', async (req, res) => {
   }
 });
 
-app.post('/api/super-admin/negocios', async (req, res) => {
+app.post('/api/super-admin/negocios', validarSuperAdmin, async (req, res) => {
   try {
-    const negocio = req.body;
+    const { nombreNegocio, email } = req.body;
 
-    // Generar ID único
+    if (!nombreNegocio || !email) {
+      return res.status(400).json({ error: 'Faltan datos requeridos: nombreNegocio y email' });
+    }
+
+    // Generar credenciales automáticamente
     const negocioID = 'neg_' + Math.random().toString(36).substring(2, 15);
+    const user = nombreNegocio.toLowerCase().replace(/[^a-z0-9]/g, '').substring(0, 10) || 'user' + Date.now();
+    const pin = Math.floor(1000 + Math.random() * 9000).toString();
 
     // Crear documento del negocio con estructura completa
     await db.collection('negocios').doc(negocioID).set({
-      ...negocio,
+      nombre: nombreNegocio,
+      slogan: 'Los mejores productos al mejor precio',
+      admin: {
+        user: user,
+        pin: pin,
+        email: email
+      },
+      colores: {
+        primario: '#667eea',
+        secundario: '#10B981'
+      },
+      contacto: {
+        telefono: '',
+        whatsapp: '',
+        email: email,
+        direccion: '',
+        redesSociales: {
+          facebook: '',
+          instagram: ''
+        }
+      },
+      contenido: {
+        sobreNosotros: 'Somos una empresa dedicada a ofrecer los mejores productos.',
+        mision: '',
+        vision: ''
+      },
       seccionesActivas: {
         hero: true,
         servicios: true,
@@ -162,17 +208,29 @@ app.post('/api/super-admin/negocios', async (req, res) => {
         galeria: true,
         contacto: true
       },
+      activo: true,
+      briefCompletado: false,
       createdAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    res.json({ success: true, negocioID });
+    res.json({ 
+      success: true, 
+      negocioID,
+      negocio: {
+        negocioID,
+        user,
+        pin,
+        nombreNegocio,
+        email
+      }
+    });
   } catch (error) {
     console.error('Error creando negocio:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
-app.put('/api/super-admin/negocios/:negocioID', async (req, res) => {
+app.put('/api/super-admin/negocios/:negocioID', validarSuperAdmin, async (req, res) => {
   try {
     const { negocioID } = req.params;
     const datos = req.body;
@@ -189,11 +247,10 @@ app.put('/api/super-admin/negocios/:negocioID', async (req, res) => {
   }
 });
 
-app.delete('/api/super-admin/negocios/:negocioID', async (req, res) => {
+app.delete('/api/super-admin/negocios/:negocioID', validarSuperAdmin, async (req, res) => {
   try {
     const { negocioID } = req.params;
     
-    // Eliminar todas las subcolecciones
     const collections = ['productos', 'servicios', 'testimonios', 'casosExito', 'galeria', 'pedidos'];
     
     for (const collectionName of collections) {
@@ -203,7 +260,6 @@ app.delete('/api/super-admin/negocios/:negocioID', async (req, res) => {
       await batch.commit();
     }
 
-    // Eliminar documento principal
     await db.collection('negocios').doc(negocioID).delete();
 
     res.json({ success: true });
@@ -338,7 +394,7 @@ app.get('/api/:negocioID/productos', async (req, res) => {
   try {
     const { negocioID } = req.params;
     const productosRef = db.collection('negocios').doc(negocioID).collection('productos');
-    const snapshot = await productosRef.where('activo', '==', true).get();
+    const snapshot = await productosRef.get();
 
     const productos = [];
     snapshot.forEach(doc => {
@@ -710,9 +766,9 @@ app.get('/health', (req, res) => {
 app.get('/', (req, res) => {
   res.json({
     message: 'API Multi-tenant con sistema modular',
-    version: '2.0.0',
+    version: '2.1.0',
     endpoints: [
-      'CRUD /api/super-admin/negocios - Gestión de negocios',
+      'CRUD /api/super-admin/negocios - Gestión de negocios (requiere superAdminKey)',
       'POST /api/auth/login',
       'GET /api/:negocioID/config',
       'PUT /api/:negocioID/config',
